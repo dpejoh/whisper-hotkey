@@ -8,20 +8,22 @@ Press your configured hotkey to start recording. Press it again to stop and tran
 The result is copied to clipboard and pasted into the active text field.
 
 Requirements:
-    pip install faster-whisper sounddevice scipy keyboard pyperclip pyautogui PyQt6
+    pip install faster-whisper sounddevice scipy keyboard pyperclip pyautogui PySide6
     pip install nvidia-cublas-cu12 nvidia-cudnn-cu12   (for CUDA)
 """
 
-import os, sys, json, math, time, tempfile, threading, datetime
+import os, sys, json, math, threading, datetime
 from pathlib import Path
 from dataclasses import dataclass, asdict
 
 # ── CUDA DLL pre-registration ─────────────────────────────────────────────────
 # Must happen before ctranslate2/faster-whisper are imported, not inside a thread.
+import sysconfig as _sysconfig
+_sp = _sysconfig.get_path("purelib")
 _DEFAULT_CUDA_PATHS = [
-    r"C:\Users\khaled\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cublas\bin",
-    r"C:\Users\khaled\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cudnn\bin",
-]
+    str(Path(_sp) / "nvidia" / "cublas" / "bin"),
+    str(Path(_sp) / "nvidia" / "cudnn"  / "bin"),
+] if _sp else []
 _cfg_file = Path.home() / ".whisper_hotkey" / "config.json"
 _cuda_paths = list(_DEFAULT_CUDA_PATHS)
 if _cfg_file.exists():
@@ -44,11 +46,40 @@ for _p in _cuda_paths:
 
 import ctypes
 import numpy as np
-import scipy.io.wavfile as wav
 import sounddevice as sd
 import keyboard
 import pyperclip
-import pyautogui
+
+# ── Win32 SendInput structs (module-level — defined once, not per call) ───────
+_PUL = ctypes.POINTER(ctypes.c_ulong)
+
+class _KeyBdInput(ctypes.Structure):
+    _fields_ = [
+        ("wVk",         ctypes.c_ushort),
+        ("wScan",       ctypes.c_ushort),
+        ("dwFlags",     ctypes.c_ulong),
+        ("time",        ctypes.c_ulong),
+        ("dwExtraInfo", _PUL),
+    ]
+
+# The union must be at least as wide as MOUSEINPUT (28 bytes on 64-bit)
+# so that sizeof(INPUT) matches Windows exactly.
+class _InputUnion(ctypes.Union):
+    _fields_ = [
+        ("ki",   _KeyBdInput),
+        ("_pad", ctypes.c_ubyte * 28),
+    ]
+
+class _Input(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_ulong),
+        ("ii",   _InputUnion),
+    ]
+
+_INPUT_STRUCT_SIZE  = ctypes.sizeof(_Input)
+_KEYEVENTF_UNICODE  = 0x0004
+_KEYEVENTF_KEYUP    = 0x0002
+_INPUT_KEYBOARD     = 1
 
 # ── Direct text insertion (no clipboard) ─────────────────────────────────────
 
@@ -58,36 +89,6 @@ def _type_text_direct(text: str) -> None:
     with KEYEVENTF_UNICODE — no clipboard is touched at all.
     Works with every language / Unicode character Whisper can produce.
     """
-    KEYEVENTF_UNICODE = 0x0004
-    KEYEVENTF_KEYUP   = 0x0002
-    INPUT_KEYBOARD    = 1
-
-    PUL = ctypes.POINTER(ctypes.c_ulong)
-
-    class _KeyBdInput(ctypes.Structure):
-        _fields_ = [
-            ("wVk",         ctypes.c_ushort),
-            ("wScan",       ctypes.c_ushort),
-            ("dwFlags",     ctypes.c_ulong),
-            ("time",        ctypes.c_ulong),
-            ("dwExtraInfo", PUL),
-        ]
-
-    # The union must be at least as wide as MOUSEINPUT (28 bytes on 64-bit)
-    # so that sizeof(INPUT) matches Windows exactly.
-    class _InputUnion(ctypes.Union):
-        _fields_ = [
-            ("ki",  _KeyBdInput),
-            ("_pad", ctypes.c_ubyte * 28),
-        ]
-
-    class _Input(ctypes.Structure):
-        _fields_ = [
-            ("type", ctypes.c_ulong),
-            ("ii",   _InputUnion),
-        ]
-
-    struct_size = ctypes.sizeof(_Input)
     inputs: list[_Input] = []
 
     for ch in text:
@@ -100,30 +101,29 @@ def _type_text_direct(text: str) -> None:
             surrogates = [code]
 
         for sc in surrogates:
-            for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+            for flags in (_KEYEVENTF_UNICODE, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP):
                 u = _InputUnion()
                 u.ki = _KeyBdInput(wVk=0, wScan=sc, dwFlags=flags,
                                    time=0, dwExtraInfo=None)
-                inp = _Input(type=INPUT_KEYBOARD, ii=u)
-                inputs.append(inp)
+                inputs.append(_Input(type=_INPUT_KEYBOARD, ii=u))
 
     if not inputs:
         return
     arr = (_Input * len(inputs))(*inputs)
-    ctypes.windll.user32.SendInput(len(inputs), arr, struct_size)
+    ctypes.windll.user32.SendInput(len(inputs), arr, _INPUT_STRUCT_SIZE)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QApplication, QWidget, QDialog, QSystemTrayIcon, QMenu,
     QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QComboBox,
     QPushButton, QLineEdit, QScrollArea, QFrame, QSpinBox, QFileDialog,
 )
-from PyQt6.QtCore import (
-    Qt, QThread, pyqtSignal, QTimer, QPropertyAnimation,
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QTimer, QPropertyAnimation,
     QEasingCurve, QObject,
 )
-from PyQt6.QtGui import (
+from PySide6.QtGui import (
     QIcon, QPixmap, QPainter, QColor, QBrush, QPen, QFont, QPainterPath, QAction,
 )
 
@@ -131,173 +131,317 @@ from PyQt6.QtGui import (
 # THEME
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Windows 11 DWM Mica / Acrylic backdrop ────────────────────────────────────
+# Applies the real system Mica blur to any top-level window on Win11 22H2+.
+# Falls back silently on older OS versions.
+
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+_DWMWA_SYSTEMBACKDROP_TYPE     = 38   # Win11 22H2+
+_BACKDROP_MICA                 = 2
+
+def _apply_mica(widget, is_dark: bool = True) -> None:
+    """Enable Windows 11 Mica backdrop on *widget* and set dark/light frame."""
+    try:
+        hwnd = int(widget.winId())
+        dwm  = ctypes.windll.dwmapi
+        dark = ctypes.c_int(1 if is_dark else 0)
+        dwm.DwmSetWindowAttribute(hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                  ctypes.byref(dark), ctypes.sizeof(dark))
+        mica = ctypes.c_int(_BACKDROP_MICA)
+        dwm.DwmSetWindowAttribute(hwnd, _DWMWA_SYSTEMBACKDROP_TYPE,
+                                  ctypes.byref(mica), ctypes.sizeof(mica))
+    except Exception:
+        pass   # not on Windows 11 22H2+ — no-op
+
+
 def _windows_is_light() -> bool:
     """Read Windows AppsUseLightTheme registry key. Returns True for light."""
     try:
         import winreg
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-        winreg.CloseKey(key)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
         return bool(val)
     except Exception:
         return False  # default to dark if registry unavailable
 
 
 def get_style(is_dark: bool) -> str:
+    # ── Colours pixel-matched to the HTML Fluent reference ────────────────────
+    # All rgba() values are Qt-style: rgba(r, g, b, 0-255).
+    # Dark palette mirrors the HTML CSS variables exactly.
     if is_dark:
-        bg      = "#161616"; bg2     = "#1E1E1E"; bg3     = "#222222"
-        border  = "#333333"; border2 = "#2D2D2D"; border3 = "#3A3A3A"
-        hover_b = "#4A4A4A"; focus_b = "#666666"
-        text    = "#E8E8E8"; muted   = "#555555"; muted2  = "#888888"
-        btn_bg  = "#272727"; btn_hov = "#323232"; btn_pre = "#1A1A1A"
-        pri_bg  = "#E8E8E8"; pri_txt = "#161616"; pri_hov = "#CCCCCC"
-        scr_trk = "#161616"; scr_hdl = "#404040"
-        menu_bg = "#1E1E1E"; menu_sel = "#2E2E2E"; menu_sep = "#2E2E2E"
-        danger_border = "#3A1A1A"; danger_txt = "#CC4444"; danger_hov = "#1E1010"; danger_hbrd = "#553333"
-        ghost_brd = "#383838"; ghost_hov_txt = "#E8E8E8"; ghost_hov_brd = "#555555"
-        inp_bg  = "#222222"
-        card_bg = "#1E1E1E"; card_brd = "#2D2D2D"; card_hov = "#3A3A3A"
-        sep_col = "#2A2A2A"
-        sec_col = "#555555"
-        placeholder = "#555555"
+        # Window / dialog base — Mica dark (#202020 + wallpaper tint → ~#1C1C1C)
+        bg       = "#1C1C1C"
+        # Card rows: rgba(255,255,255,0.04) on #1C1C1C ≈ #252525
+        card_bg  = "rgba(255, 255, 255, 10)"   # ~#252525
+        card_brd = "rgba(255, 255, 255, 17)"   # ~#313131  border-subtle
+        card_hov = "rgba(255, 255, 255, 26)"   # ~#393939  border-mid (hover)
+        # Inputs: rgba(255,255,255,0.07)
+        inp_bg   = "rgba(255, 255, 255, 18)"   # ~#2A2A2A
+        inp_hov  = "rgba(255, 255, 255, 23)"   # ~#2E2E2E
+        # Borders
+        border   = "rgba(255, 255, 255, 17)"   # default stroke
+        border2  = "rgba(255, 255, 255, 26)"   # hover stroke
+        border3  = "rgba(255, 255, 255, 46)"   # strong stroke
+        # Text — exactly from HTML --text-*
+        text     = "#FFFFFF"
+        muted2   = "#ABABAB"   # --text-secondary
+        muted    = "#686868"   # --text-tertiary
+        sec_col  = "#686868"   # section labels (tertiary)
+        placeholder = "#686868"
+        # Standard button: rgba(255,255,255,0.06)
+        btn_bg   = "rgba(255, 255, 255, 15)"
+        btn_hov  = "rgba(255, 255, 255, 23)"
+        btn_pre  = "rgba(255, 255, 255, 8)"
+        # Accent button — #0078D4
+        pri_bg   = "#0078D4"; pri_txt = "#FFFFFF"
+        pri_hov  = "#006CBE"; pri_pre = "#005BA6"
+        # Focus ring
+        focus_b  = "#0078D4"
+        hover_b  = "rgba(255, 255, 255, 46)"
+        # Ghost button
+        ghost_brd     = "rgba(255, 255, 255, 26)"
+        ghost_hov_txt = "#FFFFFF"
+        ghost_hov_brd = "rgba(255, 255, 255, 46)"
+        # Danger button — matches HTML .btn-danger
+        danger_border = "rgba(196, 43, 28, 76)"   # ~30% opacity
+        danger_txt    = "#F1707B"                  # --error
+        danger_hov    = "rgba(196, 43, 28, 31)"
+        danger_hbrd   = "rgba(196, 43, 28, 127)"
+        # Separators
+        sep_col  = "rgba(255, 255, 255, 18)"
+        # Scrollbar
+        scr_trk  = "transparent"
+        scr_hdl  = "rgba(255, 255, 255, 38)"
+        # Context menu (Acrylic-like dark surface)
+        menu_bg  = "#2C2C2C"
+        menu_sel = "#383838"
+        menu_sep = "rgba(255, 255, 255, 20)"
     else:
-        bg      = "#F2F2F2"; bg2     = "#E8E8E8"; bg3     = "#DEDEDE"
-        border  = "#D0D0D0"; border2 = "#D8D8D8"; border3 = "#C8C8C8"
-        hover_b = "#AAAAAA"; focus_b = "#888888"
-        text    = "#1A1A1A"; muted   = "#888888"; muted2  = "#777777"
-        btn_bg  = "#E0E0E0"; btn_hov = "#D4D4D4"; btn_pre = "#C8C8C8"
-        pri_bg  = "#1A1A1A"; pri_txt = "#F2F2F2"; pri_hov = "#333333"
-        scr_trk = "#F2F2F2"; scr_hdl = "#BBBBBB"
-        menu_bg = "#F8F8F8"; menu_sel = "#E8E8E8"; menu_sep = "#DDDDDD"
-        danger_border = "#F0CCCC"; danger_txt = "#CC3333"; danger_hov = "#FDF0F0"; danger_hbrd = "#E8AAAA"
-        ghost_brd = "#CCCCCC"; ghost_hov_txt = "#1A1A1A"; ghost_hov_brd = "#999999"
-        inp_bg  = "#FFFFFF"
-        card_bg = "#FFFFFF"; card_brd = "#E0E0E0"; card_hov = "#CCCCCC"
-        sep_col = "#DDDDDD"
-        sec_col = "#999999"
-        placeholder = "#AAAAAA"
+        # Light palette — Mica light (#F3F3F3)
+        bg       = "#F3F3F3"
+        card_bg  = "rgba(255, 255, 255, 178)"  # rgba(255,255,255,0.70)
+        card_brd = "rgba(0, 0, 0, 15)"
+        card_hov = "rgba(0, 0, 0, 23)"
+        inp_bg   = "#FFFFFF"
+        inp_hov  = "#F6F6F6"
+        border   = "rgba(0, 0, 0, 15)"
+        border2  = "rgba(0, 0, 0, 23)"
+        border3  = "rgba(0, 0, 0, 36)"
+        text     = "#1A1A1A"
+        muted2   = "#616161"
+        muted    = "#9E9E9E"
+        sec_col  = "#9E9E9E"
+        placeholder = "#9E9E9E"
+        btn_bg   = "rgba(255, 255, 255, 178)"
+        btn_hov  = "rgba(0, 0, 0, 10)"
+        btn_pre  = "rgba(0, 0, 0, 18)"
+        pri_bg   = "#0078D4"; pri_txt = "#FFFFFF"
+        pri_hov  = "#006CBE"; pri_pre = "#005BA6"
+        focus_b  = "#0078D4"
+        hover_b  = "rgba(0, 0, 0, 46)"
+        ghost_brd     = "rgba(0, 0, 0, 31)"
+        ghost_hov_txt = "#1A1A1A"
+        ghost_hov_brd = "rgba(0, 0, 0, 56)"
+        danger_border = "rgba(196, 43, 28, 64)"
+        danger_txt    = "#C42B1C"
+        danger_hov    = "rgba(196, 43, 28, 15)"
+        danger_hbrd   = "rgba(196, 43, 28, 102)"
+        sep_col  = "rgba(0, 0, 0, 20)"
+        scr_trk  = "transparent"
+        scr_hdl  = "rgba(0, 0, 0, 46)"
+        menu_bg  = "#FFFFFF"
+        menu_sel = "#F2F2F2"
+        menu_sep = "rgba(0, 0, 0, 20)"
 
     return f"""
+/* ── Mica window base ──────────────────────────────────────────────────────── */
 QWidget {{
     background-color: {bg};
     color: {text};
-    font-family: "Segoe UI", "SF Pro Text", sans-serif;
-    font-size: 10pt;
+    font-family: "Segoe UI Variable", "Segoe UI", sans-serif;
+    font-size: 9.5pt;
+    letter-spacing: 0.01em;
 }}
-QDialog {{ background-color: {bg}; }}
-QLabel  {{ background: transparent; }}
+QDialog  {{ background-color: {bg}; }}
+QLabel   {{ background: transparent; }}
 
+/* ── Card surface (matches HTML .card / .hist-card) ──────────────────────── */
 QFrame#card {{
     background-color: {card_bg};
     border: 1px solid {card_brd};
-    border-radius: 6px;
+    border-radius: 8px;
 }}
 QFrame#card:hover {{ border-color: {card_hov}; }}
+
+/* ── Hairline separator ──────────────────────────────────────────────────── */
 QFrame#separator {{
     background-color: {sep_col};
     max-height: 1px;
     border: none;
 }}
 
+/* ── Labels ──────────────────────────────────────────────────────────────── */
 QLabel#section_label {{
     color: {sec_col};
-    font-size: 8pt;
+    font-size: 7pt;
     font-weight: 600;
-    letter-spacing: 1.2px;
+    letter-spacing: 0.08em;
     margin-top: 4px;
+    margin-bottom: 1px;
 }}
-QLabel#muted      {{ color: {muted};  font-size: 8pt; font-family: "Consolas"; }}
-QLabel#body_text  {{ color: {muted2}; font-size: 9.5pt; }}
+QLabel#muted      {{ color: {muted};  font-size: 8pt;   font-family: "Cascadia Code", "Consolas"; }}
+QLabel#body_text  {{ color: {muted2}; font-size: 9.5pt; line-height: 1.5; }}
 QLabel#empty_hint {{ color: {muted};  font-size: 9.5pt; padding: 48px 0; }}
 
+/* ── ComboBox ─────────────────────────────────────────────────────────────── */
 QComboBox {{
     background-color: {inp_bg};
     border: 1px solid {border};
     border-radius: 4px;
-    padding: 5px 10px;
+    padding: 3px 28px 3px 9px;
     color: {text};
-    min-height: 26px;
+    min-height: 27px;
 }}
-QComboBox:hover  {{ border-color: {hover_b}; }}
+QComboBox:hover {{
+    background-color: {inp_hov};
+    border-color: {border2};
+}}
+QComboBox:focus {{
+    border-color: {border2};
+    border-bottom-color: {focus_b};
+    border-bottom-width: 2px;
+}}
 QComboBox::drop-down {{ border: none; width: 24px; }}
-QComboBox::down-arrow {{ image: none; }}
+QComboBox::down-arrow {{ image: none; width: 0; }}
 QComboBox QAbstractItemView {{
-    background-color: {bg2};
-    border: 1px solid {border3};
+    background-color: {menu_bg};
+    border: 1px solid {card_brd};
+    border-radius: 8px;
     color: {text};
-    selection-background-color: {bg3};
+    selection-background-color: {menu_sel};
+    selection-color: {text};
+    padding: 3px 0;
     outline: none;
 }}
+QComboBox QAbstractItemView::item {{
+    padding: 5px 12px;
+    border-radius: 4px;
+    margin: 1px 4px;
+    min-height: 22px;
+}}
+
+
+/* ── LineEdit — Fluent bottom-border focus ────────────────────────────────── */
 QLineEdit {{
     background-color: {inp_bg};
     border: 1px solid {border};
     border-radius: 4px;
-    padding: 5px 10px;
+    padding: 3px 9px;
     color: {text};
-    min-height: 26px;
+    min-height: 27px;
+    selection-background-color: {pri_bg};
+    selection-color: white;
 }}
-QLineEdit:hover  {{ border-color: {hover_b}; }}
-QLineEdit:focus  {{ border-color: {focus_b}; }}
+QLineEdit:hover {{
+    background-color: {inp_hov};
+    border-color: {border2};
+}}
+QLineEdit:focus {{
+    border-color: {border2};
+    border-bottom-color: {focus_b};
+    border-bottom-width: 2px;
+}}
 
+/* ── Standard button ─────────────────────────────────────────────────────── */
 QPushButton {{
     background-color: {btn_bg};
     border: 1px solid {border};
     border-radius: 4px;
-    padding: 6px 16px;
+    padding: 4px 14px;
     color: {text};
-    min-height: 26px;
+    min-height: 27px;
+    font-size: 9.5pt;
 }}
 QPushButton:hover   {{ background-color: {btn_hov}; border-color: {hover_b}; }}
 QPushButton:pressed {{ background-color: {btn_pre}; }}
+
+/* ── Accent / primary button — Windows blue ──────────────────────────────── */
 QPushButton#primary {{
     background-color: {pri_bg};
-    border-color: {pri_bg};
+    border: 1px solid rgba(0, 0, 0, 36);
+    border-bottom-color: rgba(0, 0, 0, 64);
     color: {pri_txt};
     font-weight: 600;
 }}
 QPushButton#primary:hover   {{ background-color: {pri_hov}; }}
-QPushButton#primary:pressed {{ background-color: {btn_pre}; }}
+QPushButton#primary:pressed {{ background-color: {pri_pre}; }}
+
+/* ── Ghost (subtle) button ───────────────────────────────────────────────── */
 QPushButton#ghost {{
     background: transparent;
     border: 1px solid {ghost_brd};
     color: {muted2};
     font-size: 9pt;
+    min-height: 27px;
+    padding: 4px 12px;
 }}
-QPushButton#ghost:hover {{ color: {ghost_hov_txt}; border-color: {ghost_hov_brd}; }}
+QPushButton#ghost:hover  {{ color: {ghost_hov_txt}; border-color: {ghost_hov_brd}; background: {btn_hov}; }}
+QPushButton#ghost:pressed {{ background: {btn_pre}; }}
+
+/* ── Danger button ───────────────────────────────────────────────────────── */
 QPushButton#danger {{
     background: transparent;
     border: 1px solid {danger_border};
     color: {danger_txt};
     font-size: 9pt;
+    min-height: 27px;
+    padding: 4px 12px;
 }}
 QPushButton#danger:hover {{ background-color: {danger_hov}; border-color: {danger_hbrd}; }}
 
-QScrollArea              {{ background: transparent; border: none; }}
-QScrollBar:vertical      {{ background: {scr_trk}; width: 5px; border-radius: 2px; }}
-QScrollBar::handle:vertical {{ background: {scr_hdl}; border-radius: 2px; min-height: 30px; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
+/* ── Scrollbar — 4 px thin like HTML ────────────────────────────────────── */
+QScrollArea {{ background: transparent; border: none; }}
+QScrollBar:vertical {{
+    background: {scr_trk};
+    width: 4px;
+    border-radius: 2px;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {scr_hdl};
+    border-radius: 2px;
+    min-height: 32px;
+}}
+QScrollBar::handle:vertical:hover {{ background: {hover_b}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; border: none; }}
+QScrollBar::add-page:vertical,  QScrollBar::sub-page:vertical {{ background: none; }}
 
+/* ── SpinBox ─────────────────────────────────────────────────────────────── */
 QSpinBox {{
     background-color: {inp_bg};
     border: 1px solid {border};
     border-radius: 4px;
-    padding: 5px 10px;
+    padding: 3px 9px;
     color: {text};
-    min-height: 26px;
+    min-height: 27px;
 }}
-QSpinBox::up-button, QSpinBox::down-button {{ width: 0; }}
+QSpinBox:hover {{ border-color: {border2}; }}
+QSpinBox:focus {{ border-color: {border2}; border-bottom-color: {focus_b}; border-bottom-width: 2px; }}
+QSpinBox::up-button, QSpinBox::down-button {{ width: 0; border: none; }}
 
+/* ── Context / tray menu ─────────────────────────────────────────────────── */
 QMenu {{
     background-color: {menu_bg};
-    border: 1px solid {border};
+    border: 1px solid {card_brd};
+    border-radius: 8px;
     color: {text};
     padding: 4px 0;
 }}
-QMenu::item          {{ padding: 7px 18px; font-size: 9.5pt; }}
+QMenu::item          {{ padding: 5px 16px 5px 12px; font-size: 9.5pt; border-radius: 4px; margin: 1px 4px; min-height: 24px; }}
 QMenu::item:selected {{ background-color: {menu_sel}; }}
-QMenu::item:disabled {{ color: {muted}; }}
+QMenu::item:disabled {{ color: {muted}; font-weight: 600; font-size: 8pt; padding-top: 7px; padding-bottom: 5px; }}
 QMenu::separator     {{ height: 1px; background: {menu_sep}; margin: 3px 0; }}
 """
 
@@ -362,7 +506,9 @@ class History:
 
     def _save(self):
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self.entries, indent=2))
+        tmp = self._path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.entries, indent=2))
+        tmp.replace(self._path)   # atomic on all major OSes
 
     def clear(self):
         self.entries = []
@@ -373,9 +519,9 @@ class History:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ModelLoader(QThread):
-    loaded = pyqtSignal(object)
-    failed = pyqtSignal(str)
-    status = pyqtSignal(str)
+    loaded = Signal(object)
+    failed = Signal(str)
+    status = Signal(str)
 
     def __init__(self, cfg: Config):
         super().__init__()
@@ -396,8 +542,8 @@ class ModelLoader(QThread):
 
 
 class TranscribeWorker(QThread):
-    finished = pyqtSignal(str)
-    failed   = pyqtSignal(str)
+    finished = Signal(str)
+    failed   = Signal(str)
     _SR = 16000
 
     def __init__(self, model, audio: np.ndarray, language: str):
@@ -408,12 +554,8 @@ class TranscribeWorker(QThread):
 
     def run(self):
         try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-                tmp = f.name
-            wav.write(tmp, self._SR, (self.audio * 32767).astype(np.int16))
-            segs, _ = self.model.transcribe(tmp, language=self.language)
+            segs, _ = self.model.transcribe(self.audio, language=self.language)
             text = " ".join(s.text for s in segs).strip()
-            os.unlink(tmp)
             self.finished.emit(text)
         except Exception as e:
             self.failed.emit(str(e))
@@ -422,25 +564,46 @@ class TranscribeWorker(QThread):
 # TRAY ICON
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Icon files live in the /icons subfolder next to this script.
+_ICON_DIR = Path(__file__).resolve().parent / "icons"
+
+# state → preferred filename candidates (first found wins)
+_ICON_FILES: dict[str, list[str]] = {
+    "idle":      ["whisper-transparent.png", "whisper-transparent.svg"],
+    "recording": ["whisper-transparent-red.png", "whisper-transparent-red.svg"],
+    "loading":   ["whisper-transparent-blue.png", "whisper-transparent-blue.svg"],
+}
+
+
 def _make_icon(state: str) -> QIcon:
-    """Programmatic mic icon. state: idle | recording | loading"""
+    """
+    Load a tray icon from the asset files that live next to the script.
+    Falls back to a minimal programmatic icon if no file is found.
+
+    state: idle | recording | loading
+    """
+    for name in _ICON_FILES.get(state, []):
+        path = _ICON_DIR / name
+        if path.exists():
+            return QIcon(str(path))
+
+    # ── Fallback: simple coloured dot (no asset files found) ─────────────────
+    _fallback_colours = {
+        "idle":      QColor(50,  50,  50),
+        "recording": QColor(196, 43,  28),
+        "loading":   QColor(0,   120, 212),
+    }
     sz  = 64
     px  = QPixmap(sz, sz)
     px.fill(Qt.GlobalColor.transparent)
     p   = QPainter(px)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     mid = sz // 2
-
-    bg = {"idle": QColor(90, 90, 90), "recording": QColor(210, 48, 48), "loading": QColor(55, 55, 55)}[state]
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QBrush(bg))
+    p.setBrush(QBrush(_fallback_colours.get(state, QColor(50, 50, 50))))
     p.drawEllipse(1, 1, sz - 2, sz - 2)
-
-    # Mic capsule
     p.setBrush(QBrush(QColor(235, 235, 235)))
     p.drawRoundedRect(mid - 9, 10, 18, 27, 9, 9)
-
-    # Stand
     pen = QPen(QColor(235, 235, 235), 3.5)
     pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     p.setPen(pen)
@@ -451,12 +614,21 @@ def _make_icon(state: str) -> QIcon:
     p.end()
     return QIcon(px)
 
+
+def _app_icon() -> QIcon:
+    """Window / taskbar / shortcut icon — whisper.svg (or .png fallback)."""
+    for name in ("whisper.svg", "whisper.png"):
+        path = _ICON_DIR / name
+        if path.exists():
+            return QIcon(str(path))
+    return _make_icon("idle")   # absolute last resort
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TOGGLE SWITCH
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ToggleSwitch(QWidget):
-    toggled = pyqtSignal(bool)
+    toggled = Signal(bool)
 
     def __init__(self, checked: bool = False):
         super().__init__()
@@ -477,19 +649,35 @@ class ToggleSwitch(QWidget):
         self.toggled.emit(self._on)
         self.update()
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return):
+            self._on = not self._on
+            self.toggled.emit(self._on)
+            self.update()
+        else:
+            super().keyPressEvent(event)
+
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h, r = self.width(), self.height(), self.height() / 2
-        track = QColor("#E8E8E8") if self._on else QColor("#404040")
+
+        # Track: HTML toggle-track — accent #0078D4 ON, rgba(255,255,255,15%) OFF
+        tpath = QPainterPath()
+        tpath.addRoundedRect(0, 0, w, h, r, r)
+        if self._on:
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QBrush(QColor(0, 120, 212)))         # #0078D4 AccentFill
+        else:
+            p.setPen(QPen(QColor(255, 255, 255, 90), 1.2))  # subtle border
+            p.setBrush(QBrush(QColor(255, 255, 255, 38)))   # rgba(255,255,255,15%)
+        p.drawPath(tpath)
+
+        # Thumb: white ON, #B4B4B4 OFF — same as HTML
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(track))
-        path = QPainterPath()
-        path.addRoundedRect(0, 0, w, h, r, r)
-        p.drawPath(path)
-        m  = 2
+        m  = 3
         tx = w - h + m if self._on else m
-        p.setBrush(QBrush(QColor("#161616") if self._on else QColor("#909090")))
+        p.setBrush(QBrush(QColor(255, 255, 255) if self._on else QColor(180, 180, 180)))
         p.drawEllipse(int(tx), m, h - m * 2, h - m * 2)
         p.end()
 
@@ -518,16 +706,20 @@ class RecordingOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(320, 50)
 
-        self._tick  = QTimer(interval=1000)
+        self._tick  = QTimer()
+        self._tick.setInterval(1000)
         self._tick.timeout.connect(self._on_tick)
 
-        self._anim  = QTimer(interval=48)
+        self._anim  = QTimer()
+        self._anim.setInterval(48)
         self._anim.timeout.connect(self._on_anim)
 
-        self._hide  = QTimer(singleShot=True)
+        self._hide  = QTimer()
+        self._hide.setSingleShot(True)
         self._hide.timeout.connect(self._fade_out)
 
-        self._fade  = QPropertyAnimation(self, b"windowOpacity", duration=380)
+        self._fade  = QPropertyAnimation(self, b"windowOpacity")
+        self._fade.setDuration(380)
         self._fade.setEasingCurve(QEasingCurve.Type.InCubic)
         self._fade.finished.connect(self.hide)
 
@@ -560,8 +752,10 @@ class RecordingOverlay(QWidget):
 
     def show_transcribing(self):
         self._tick.stop()
+        self._anim.stop()
         self.state = "transcribing"
         self.update()
+        self._anim.start()
 
     def show_done(self, text: str):
         self._anim.stop()
@@ -597,15 +791,15 @@ class RecordingOverlay(QWidget):
         p.setBrush(QColor(0, 0, 0, 50 if self.is_dark else 20))
         p.drawPath(sh)
 
-        # Background pill — dark: near-black / light: near-white
+        # Background pill — matches HTML .pill: rgba(22,22,22,0.94) dark / rgba(243,243,243,0.98) light
         bg = QPainterPath()
-        bg.addRoundedRect(0, 0, cW, cH, 11, 11)
+        bg.addRoundedRect(0, 0, cW, cH, 12, 12)
         if self.is_dark:
-            p.setBrush(QColor(20, 20, 20, 248))
-            p.setPen(QPen(QColor(48, 48, 48, 200), 1))
+            p.setBrush(QColor(22, 22, 22, 240))           # rgba(22,22,22,0.94)
+            p.setPen(QPen(QColor(255, 255, 255, 26), 1))  # border-subtle
         else:
-            p.setBrush(QColor(250, 250, 250, 252))
-            p.setPen(QPen(QColor(200, 200, 200, 220), 1))
+            p.setBrush(QColor(243, 243, 243, 250))
+            p.setPen(QPen(QColor(0, 0, 0, 15), 1))
         p.drawPath(bg)
 
         cy = cH // 2
@@ -618,71 +812,79 @@ class RecordingOverlay(QWidget):
     def _draw_recording(self, p, W, H, cy):
         cx = 22
         pulse = 0.5 + 0.5 * math.sin(self._phase)
-        # Pulse ring
+        # Pulse ring — HTML: rgba(241,112,123,0.5) → QColor(241,112,123, alpha)
         ring = int(8 + 5 * pulse)
-        p.setPen(QPen(QColor(220, 48, 48, int(70 * pulse)), 1.5))
+        p.setPen(QPen(QColor(241, 112, 123, int(127 * pulse)), 1.5))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawEllipse(cx - ring, cy - ring, ring * 2, ring * 2)
-        # Dot
+        # Dot — HTML: #F1707B (--error)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(220, 48, 48))
+        p.setBrush(QColor(241, 112, 123))
         p.drawEllipse(cx - 6, cy - 6, 12, 12)
-        # Label
-        p.setPen(QColor(30, 30, 30) if not self.is_dark else QColor(232, 232, 232))
-        p.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
+        # "Recording" label — HTML: --text-primary #FFFFFF
+        p.setPen(QColor(255, 255, 255) if self.is_dark else QColor(26, 26, 26))
+        p.setFont(QFont("Segoe UI Variable", 10, QFont.Weight.Medium))
         p.drawText(42, 0, 140, H, Qt.AlignmentFlag.AlignVCenter, "Recording")
-        # Timer
-        p.setPen(QColor(150, 150, 150) if not self.is_dark else QColor(110, 110, 110))
-        p.setFont(QFont("Consolas", 9))
+        # Timer — HTML: --text-tertiary #686868
+        p.setPen(QColor(104, 104, 104))
+        p.setFont(QFont("Cascadia Code", 9))
         m, s = self.elapsed // 60, self.elapsed % 60
         p.drawText(0, 0, W - 12, H, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, f"{m:02d}:{s:02d}")
 
     def _draw_transcribing(self, p, W, H, cy):
         cx = 22
-        t  = time.time()
         for i in range(8):
-            angle = i * (2 * math.pi / 8) - (t * 5 % (2 * math.pi))
+            angle = i * (2 * math.pi / 8) - self._phase
             sx = cx + 8 * math.cos(angle)
             sy = cy + 8 * math.sin(angle)
             p.setPen(Qt.PenStyle.NoPen)
-            if self.is_dark:
-                p.setBrush(QColor(180, 180, 180, int(40 + 215 * (i / 8))))
-            else:
-                p.setBrush(QColor(80, 80, 80, int(40 + 215 * (i / 8))))
+            # HTML spin-dot: --text-secondary #ABABAB with opacity falloff
+            alpha = int(40 + 215 * (i / 8))
+            p.setBrush(QColor(171, 171, 171, alpha) if self.is_dark else QColor(80, 80, 80, alpha))
             p.drawEllipse(int(sx) - 2, int(sy) - 2, 4, 4)
-        p.setPen(QColor(30, 30, 30) if not self.is_dark else QColor(200, 200, 200))
-        p.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
+        # "Transcribing…" — HTML: --text-secondary #ABABAB
+        p.setPen(QColor(171, 171, 171) if self.is_dark else QColor(97, 97, 97))
+        p.setFont(QFont("Segoe UI Variable", 10, QFont.Weight.Medium))
         p.drawText(42, 0, W - 50, H, Qt.AlignmentFlag.AlignVCenter, "Transcribing…")
-        QTimer.singleShot(48, self.update)
 
     def _draw_done(self, p, W, H, cy):
         cx = 22
         p.setPen(Qt.PenStyle.NoPen)
-        # Checkmark circle — inverts with theme
-        circle_fill  = QColor(30, 30, 30)   if not self.is_dark else QColor(232, 232, 232)
-        check_stroke = QColor(250, 250, 250) if not self.is_dark else QColor(20, 20, 20)
-        p.setBrush(circle_fill)
-        p.drawEllipse(cx - 8, cy - 8, 16, 16)
-        pen = QPen(check_stroke, 2.5)
+        # HTML .check-circle: rgba(0,120,212,0.2) fill + #0078D4 border
+        p.setBrush(QColor(0, 120, 212, 51))
+        p.drawEllipse(cx - 9, cy - 9, 18, 18)
+        pen_ring = QPen(QColor(0, 120, 212), 1.5)
+        p.setPen(pen_ring); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(cx - 9, cy - 9, 18, 18)
+        # White checkmark
+        pen = QPen(QColor(0, 120, 212), 2.5)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        p.setPen(pen); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(pen)
         p.drawLine(cx - 4, cy + 1, cx - 1, cy + 4)
         p.drawLine(cx - 1, cy + 4, cx + 5, cy - 3)
-        p.setPen(QColor(90, 90, 90) if not self.is_dark else QColor(170, 170, 170))
-        p.setFont(QFont("Segoe UI", 9))
+        # Preview text — HTML: --text-secondary #ABABAB
+        p.setPen(QColor(171, 171, 171) if self.is_dark else QColor(97, 97, 97))
+        p.setFont(QFont("Segoe UI Variable", 9))
         p.drawText(42, 0, W - 50, H, Qt.AlignmentFlag.AlignVCenter, self.preview)
 
     def _draw_error(self, p, W, H, cy):
         cx = 22
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(180, 40, 40))
-        p.drawEllipse(cx - 8, cy - 8, 16, 16)
-        p.setPen(QColor(232, 232, 232))
-        p.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        p.drawText(cx - 3, cy + 5, "!")
-        p.setPen(QColor(90, 90, 90) if not self.is_dark else QColor(170, 170, 170))
-        p.setFont(QFont("Segoe UI", 9))
+        # HTML .error-circle: rgba(241,112,123,0.2) fill + #F1707B border
+        p.setBrush(QColor(241, 112, 123, 51))
+        p.drawEllipse(cx - 9, cy - 9, 18, 18)
+        p.setPen(QPen(QColor(241, 112, 123), 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(cx - 9, cy - 9, 18, 18)
+        # × mark in error red
+        pen = QPen(QColor(241, 112, 123), 2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(cx - 4, cy - 4, cx + 4, cy + 4)
+        p.drawLine(cx + 4, cy - 4, cx - 4, cy + 4)
+        # Error text — HTML: --text-secondary #ABABAB
+        p.setPen(QColor(171, 171, 171) if self.is_dark else QColor(97, 97, 97))
+        p.setFont(QFont("Segoe UI Variable", 9))
         p.drawText(42, 0, W - 50, H, Qt.AlignmentFlag.AlignVCenter, self.preview)
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -690,24 +892,30 @@ class RecordingOverlay(QWidget):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class HistoryWindow(QWidget):
-    def __init__(self, history: History):
+    def __init__(self, history: History, is_dark: bool = True):
         super().__init__()
         self.history = history
+        self._is_dark = is_dark
         self.setWindowTitle("Whisper — History")
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowCloseButtonHint)
         self.setMinimumSize(480, 420)
         self.resize(480, 580)
         self._build()
 
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._refresh()
+        _apply_mica(self, self._is_dark)
+
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 16)
-        root.setSpacing(14)
+        root.setContentsMargins(16, 16, 16, 12)
+        root.setSpacing(10)
 
         # Header row
         hdr = QHBoxLayout()
         title = QLabel("History")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Light))
+        title.setFont(QFont("Segoe UI Variable", 13, QFont.Weight.Light))
         hdr.addWidget(title)
         hdr.addStretch()
         self._clear_btn = QPushButton("Clear all")
@@ -756,8 +964,8 @@ class HistoryWindow(QWidget):
         card = QFrame()
         card.setObjectName("card")
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(14, 10, 14, 12)
-        lay.setSpacing(7)
+        lay.setContentsMargins(12, 8, 12, 10)
+        lay.setSpacing(5)
 
         top = QHBoxLayout()
         ts  = QLabel(self._fmt(entry["ts"]))
@@ -805,16 +1013,12 @@ class HistoryWindow(QWidget):
         if self.isVisible():
             self._refresh()
 
-    def showEvent(self, e):
-        self._refresh()
-        super().showEvent(e)
-
 # ──────────────────────────────────────────────────────────────────────────────
 # SETTINGS DIALOG
 # ──────────────────────────────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
-    saved = pyqtSignal(object)   # emits Config
+    saved = Signal(object)   # emits Config
 
     _MODELS   = ["tiny", "base", "small", "medium", "large-v2", "large-v3", "turbo"]
     _DEVICES  = ["cuda", "cpu"]
@@ -832,14 +1036,20 @@ class SettingsDialog(QDialog):
         ("Portuguese",  "pt"),   ("Italian",    "it"), ("Korean",     "ko"),
     ]
 
-    def __init__(self, cfg: Config, history: History, parent=None):
+    def __init__(self, cfg: Config, history: History, parent=None, is_dark: bool = True):
         super().__init__(parent)
         self.cfg     = cfg
         self.history = history
+        self._is_dark = is_dark
         self.setWindowTitle("Settings")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint)
-        self.setFixedWidth(500)
+        self.setFixedWidth(440)
         self._build()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        _apply_mica(self, self._is_dark)
+
 
     def _section(self, text: str) -> QLabel:
         lbl = QLabel(text)
@@ -853,8 +1063,8 @@ class SettingsDialog(QDialog):
 
     def _form(self, card: QFrame) -> QFormLayout:
         fl = QFormLayout(card)
-        fl.setContentsMargins(14, 12, 14, 14)
-        fl.setSpacing(11)
+        fl.setContentsMargins(12, 8, 12, 10)
+        fl.setSpacing(7)
         fl.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         fl.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         fl.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
@@ -862,11 +1072,11 @@ class SettingsDialog(QDialog):
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(6)
 
         title = QLabel("Settings")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Light))
+        title.setFont(QFont("Segoe UI Variable", 13, QFont.Weight.Light))
         root.addWidget(title)
 
         sep = QFrame()
@@ -949,7 +1159,7 @@ class SettingsDialog(QDialog):
         root.addWidget(self._section("HISTORY"))
         card5 = self._card()
         hlay  = QHBoxLayout(card5)
-        hlay.setContentsMargins(14, 12, 14, 12)
+        hlay.setContentsMargins(12, 8, 12, 8)
         hlay.setSpacing(10)
 
         hlay.addWidget(QLabel("Keep last"))
@@ -1000,9 +1210,9 @@ class SettingsDialog(QDialog):
 # ──────────────────────────────────────────────────────────────────────────────
 
 class WhisperApp(QObject):
-    _toggle_sig        = pyqtSignal()
-    _rec_started_sig   = pyqtSignal()
-    _audio_ready_sig   = pyqtSignal(object)   # numpy array
+    _toggle_sig        = Signal()
+    _rec_started_sig   = Signal()
+    _audio_ready_sig   = Signal(object)   # numpy array
 
     def __init__(self):
         super().__init__()
@@ -1017,6 +1227,7 @@ class WhisperApp(QObject):
 
         self.overlay     = RecordingOverlay(self.cfg.overlay_position)
         self._hist_win: HistoryWindow | None = None
+        self._hotkey_hook = None   # keyboard hook handle for targeted removal
 
         # Tray
         self.tray = QSystemTrayIcon()
@@ -1032,8 +1243,10 @@ class WhisperApp(QObject):
 
         # Theme — apply on start, poll every 5s for auto mode
         self._last_dark: bool | None = None
+        self._is_dark: bool = True
         self._apply_theme()
-        self._theme_timer = QTimer(interval=5000)
+        self._theme_timer = QTimer()
+        self._theme_timer.setInterval(5000)
         self._theme_timer.timeout.connect(self._apply_theme)
         self._theme_timer.start()
 
@@ -1053,6 +1266,7 @@ class WhisperApp(QObject):
         if is_dark == self._last_dark:
             return
         self._last_dark = is_dark
+        self._is_dark = is_dark
         style = get_style(is_dark)
         QApplication.instance().setStyleSheet(style)
         self.overlay.is_dark = is_dark
@@ -1102,9 +1316,25 @@ class WhisperApp(QObject):
     # ── Hotkey ───────────────────────────────────────────────────────────────
 
     def _register_hotkey(self):
-        parts = self.cfg.hotkey.split("+")
-        last, mods = parts[-1], parts[:-1]
-        keyboard.on_press_key(last, lambda _: self._toggle_sig.emit() if all(keyboard.is_pressed(k) for k in mods) else None)
+        try:
+            parts = self.cfg.hotkey.strip().split("+")
+            last, mods = parts[-1], parts[:-1]
+            if not last:
+                raise ValueError("Empty key")
+            self._hotkey_hook = keyboard.on_press_key(
+                last,
+                lambda _: self._toggle_sig.emit() if all(keyboard.is_pressed(k) for k in mods) else None
+            )
+        except Exception as e:
+            self.tray.showMessage("Whisper Hotkey", f"Invalid hotkey: {e}", QSystemTrayIcon.MessageIcon.Warning, 4000)
+
+    def _unregister_hotkey(self):
+        if self._hotkey_hook is not None:
+            try:
+                keyboard.unhook(self._hotkey_hook)
+            except Exception:
+                pass
+            self._hotkey_hook = None
 
     # ── Toggle (main thread) ─────────────────────────────────────────────────
 
@@ -1163,8 +1393,7 @@ class WhisperApp(QObject):
             return
         self.history.add(text)
         if self.cfg.auto_paste:
-            time.sleep(0.08)          # let the hotkey release be processed first
-            _type_text_direct(text)   # direct SendInput — clipboard untouched
+            QTimer.singleShot(80, lambda: _type_text_direct(text))
         self.overlay.show_done(text)
         if self._hist_win:
             self._hist_win.refresh()
@@ -1173,12 +1402,12 @@ class WhisperApp(QObject):
 
     def _open_history(self):
         if self._hist_win is None:
-            self._hist_win = HistoryWindow(self.history)
+            self._hist_win = HistoryWindow(self.history, self._is_dark)
             self._hist_win.setStyleSheet(QApplication.instance().styleSheet())
         self._hist_win.show(); self._hist_win.raise_(); self._hist_win.activateWindow()
 
     def _open_settings(self):
-        dlg = SettingsDialog(self.cfg, self.history)
+        dlg = SettingsDialog(self.cfg, self.history, is_dark=self._is_dark)
         dlg.setStyleSheet(QApplication.instance().styleSheet())
         dlg.saved.connect(self._on_settings_saved)
         dlg.exec()
@@ -1191,10 +1420,6 @@ class WhisperApp(QObject):
 
         self._apply_theme()
 
-        if new_cfg.hotkey != old.hotkey:
-            keyboard.unhook_all()
-            if self.model: self._register_hotkey()
-
         model_changed = (
             new_cfg.model        != old.model or
             new_cfg.device       != old.device or
@@ -1202,15 +1427,20 @@ class WhisperApp(QObject):
             new_cfg.cuda_cublas_path != old.cuda_cublas_path or
             new_cfg.cuda_cudnn_path  != old.cuda_cudnn_path
         )
+
         if model_changed:
+            self._unregister_hotkey()
             self.model = None
-            keyboard.unhook_all()
             self.tray.setIcon(_make_icon("loading"))
             self.tray.setToolTip("Whisper Hotkey — reloading…")
             self._start_loader()
+        elif new_cfg.hotkey != old.hotkey:
+            self._unregister_hotkey()
+            if self.model:
+                self._register_hotkey()
 
     def _quit(self):
-        keyboard.unhook_all()
+        self._unregister_hotkey()
         QApplication.quit()
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1221,6 +1451,7 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Whisper Hotkey")
+    app.setWindowIcon(_app_icon())
     cfg = Config.load()
     _is_dark = (cfg.theme == "dark") or (cfg.theme == "auto" and not _windows_is_light())
     app.setStyleSheet(get_style(_is_dark))
