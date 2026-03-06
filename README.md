@@ -4,6 +4,10 @@ A small script that lets you dictate text anywhere on your computer. Press a hot
 
 That's it. No cloud, no API key, no subscription. It runs Whisper locally on your machine.
 
+## Preview
+
+![Preview](preview.gif)
+
 ---
 
 ## Why this exists
