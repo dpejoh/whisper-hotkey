@@ -1,130 +1,116 @@
-# Whisper Hotkey
+# whisper-hotkey
 
-A system tray app that lets you dictate text into any field by pressing a hotkey, it records your voice, transcribes it with Whisper AI, and types the result instantly.
+A small script that lets you dictate text anywhere on your computer. Press a hotkey, talk, press it again, and it types what you said into whatever field you have open.
 
-## Preview
-
-![Preview](preview.gif)
-
----
-## Whisper Hotkey — Windows Setup Guide
-
-### 1 · Install Python 3.11
-
-Download the **Windows installer (64-bit)** from https://www.python.org/downloads/release/python-3119/
-
-During installation **check both boxes**:
-- ✅ Add Python to PATH
-- ✅ Install for all users  (optional but recommended)
-
-Verify in a new terminal:
-```
-python --version
-```
-Expected: `Python 3.11.x`
+That's it. No cloud, no API key, no subscription. It runs Whisper locally on your machine.
 
 ---
 
-### 2 · Install required packages
+## Why this exists
 
-Open **Command Prompt** (or PowerShell) and run:
-
-```bat
-pip install faster-whisper sounddevice scipy keyboard pyperclip pyautogui PyQt6
-```
+I got tired of cloud speech-to-text tools that require an account or send your audio somewhere. This just runs the model on your own hardware and types the result directly. Works in any app, any text field.
 
 ---
 
-### 3 · Choose your device: GPU (CUDA) or CPU
+## What you need
 
-#### Option A — NVIDIA GPU (faster, recommended if you have one)
+- Windows (uses Win32 for text input)
+- Python 3.11
+- A microphone
+- A GPU helps a lot, but it works on CPU too
 
-Install the CUDA-specific packages:
-```bat
+---
+
+## Setup
+
+Install the dependencies:
+
+```
+pip install faster-whisper sounddevice scipy keyboard pyperclip pyautogui PySide6
+```
+
+If you have an NVIDIA GPU and want faster transcription:
+
+```
 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-Find the DLL folders after install (replace `khaled` with **your Windows username**):
+Then run the script:
+
 ```
-C:\Users\<YOUR_USER>\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cublas\bin
-C:\Users\<YOUR_USER>\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cudnn\bin
-```
-
-You will paste these two paths into **Settings → CUDA DLL Paths** the first time you run the app.
-
-> **Note:** If Python is installed system-wide (not per-user), the path starts with  
-> `C:\Program Files\Python311\Lib\site-packages\nvidia\...`
-
-#### Option B — CPU only (no GPU required)
-
-No extra packages needed.  
-In **Settings** set:
-- Device → `cpu`
-- Compute type → `int8`
-- Model → `small` or `base` (large models are slow on CPU)
-
----
-
-### 4 · Run the script
-
-```bat
-python whisper_hotkey_gui.py
+python whisper_hotkey.py
 ```
 
-A microphone icon will appear in the **system tray** (bottom-right, near the clock).  
-The first launch downloads the Whisper model — this can take a minute.
+A small icon shows up in your system tray. Right-click it to open Settings and configure your hotkey, model, and device.
 
 ---
 
-### 5 · First-time settings
+## First time settings
 
-Right-click the tray icon → **Settings** and configure:
+Open Settings from the tray and set these:
 
-| Setting | Recommended |
-|---|---|
-| Whisper model | `turbo` (GPU) or `small` (CPU) |
-| Device | `cuda` or `cpu` |
-| Compute type | `float16` (GPU) or `int8` (CPU) |
-| Hotkey | e.g. `ctrl+shift+space` |
-| Auto-paste | ON |
-| CUDA cuBLAS path | *(GPU only — paste path from step 3)* |
-| CUDA cuDNN path | *(GPU only — paste path from step 3)* |
+- **Model** - use `turbo` if you have a GPU, `small` or `base` if you're on CPU
+- **Device** - `cuda` for GPU, `cpu` otherwise
+- **Compute type** - `float16` for GPU, `int8` for CPU
+- **Hotkey** - whatever you want, default is `ctrl+shift+space`
+- **Auto-paste** - leave this on, it's what types the text for you
 
-Click **Save**. The model reloads automatically.
+If you installed the CUDA packages, also paste the paths to your `cublas\bin` and `cudnn\bin` folders in the CUDA settings section. They look something like:
 
----
-
-### 6 · How to use
-
-1. Click into any text field (browser, Word, Notepad, chat app, etc.)
-2. Press your hotkey → the floating overlay shows **Recording**
-3. Speak
-4. Press the hotkey again → overlay shows **Transcribing…** then the result
-5. The transcribed text is typed directly into the focused field — **no clipboard is used**
-
----
-
-### 7 · Run on startup (optional)
-
-Press `Win + R`, type `shell:startup`, press Enter.  
-Create a shortcut to `whisper_hotkey_gui.py` (or a `.bat` file) in that folder:
-
-```bat
-@echo off
-pythonw "C:\path\to\whisper_hotkey_gui.py"
+```
+C:\Users\you\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cublas\bin
+C:\Users\you\AppData\Local\Programs\Python\Python311\Lib\site-packages\nvidia\cudnn\bin
 ```
 
-(`pythonw` runs without a console window.)
+---
+
+## How to use it
+
+1. Click into any text field
+2. Press your hotkey
+3. Talk
+4. Press the hotkey again
+5. It transcribes and types the result
+
+A small overlay appears in the corner of your screen to show when it's recording or transcribing.
 
 ---
 
-### 8 · Troubleshooting
+## Running on startup
 
-| Problem | Fix |
-|---|---|
-| `ModuleNotFoundError` | Run the `pip install` command from step 2 again |
-| CUDA error on startup | Check the DLL paths in Settings, or switch to CPU |
-| Hotkey not triggering | Try running the script **as Administrator** (keyboard hook may need elevation) |
-| No sound captured | Check Windows microphone privacy settings and default input device |
-| Text not inserted | Click the target text field *before* pressing the hotkey so it keeps focus |
-| Slow on CPU | Use `small` or `base` model with `int8` compute type |
+Press `Win+R`, type `shell:startup`, and drop a shortcut to the script or exe in that folder.
+
+---
+
+## Troubleshooting
+
+**Hotkey not working** - try running as administrator, the keyboard hook sometimes needs it.
+
+**CUDA errors** - double check your DLL paths in Settings, or just switch to CPU.
+
+**Nothing gets typed** - make sure you click the target field before pressing the hotkey so it keeps focus.
+
+**Slow on CPU** - use the `small` or `base` model with `int8` compute type.
+
+---
+
+## Models
+
+Whisper has several model sizes. Bigger models are more accurate but slower.
+
+| Model  | Speed | Accuracy |
+|--------|-------|----------|
+| tiny   | fastest | lowest |
+| base   | fast    | decent |
+| small  | good    | good |
+| medium | slow    | better |
+| turbo  | fast    | very good |
+| large  | slowest | best |
+
+For most people, `turbo` on GPU or `small` on CPU is the right pick.
+
+---
+
+## License
+
+MIT
