@@ -1,12 +1,22 @@
-# whisper-hotkey
+<p align="center">
+  <img src="icons/whisper.png" alt="Whisper Icon" width="128"/>
+</p>
 
+<h1 align="center">Whisper Hotkey</h1>
+
+<p align="center">
 A small script that lets you dictate text anywhere on your computer. Press a hotkey, talk, press it again, and it types what you said into whatever field you have open.
+</p>
 
+<p align="center">
 That's it. No cloud, no API key, no subscription. It runs Whisper locally on your machine.
+</p>
 
-## Preview
+<h2 align="center">Preview</h2>
 
-![Preview](preview.gif)
+<p align="center">
+  <img src="preview.gif" alt="Preview"/>
+</p>
 
 ---
 
