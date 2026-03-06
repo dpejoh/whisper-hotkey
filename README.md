@@ -19,7 +19,7 @@ I got tired of cloud speech-to-text tools that require an account or send your a
 ## What you need
 
 - Windows (uses Win32 for text input)
-- Python 3.11
+- Python 3.10+
 - A microphone
 - A GPU helps a lot, but it works on CPU too
 
